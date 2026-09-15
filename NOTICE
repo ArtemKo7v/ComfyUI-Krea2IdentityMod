@@ -1,0 +1,17 @@
+ComfyUI-Krea2IdentityMod
+Copyright 2026 Artem
+
+This project is distributed under the Apache License, Version 2.0.
+
+The near-matched aspect-ratio preprocessing in preprocessing.py is adapted
+from the full-target-grid branch of _fit_encode_image in ComfyUI-Krea2Edit:
+https://github.com/lbouaraba/comfyui-krea2edit
+Source: https://github.com/lbouaraba/comfyui-krea2edit/blob/main/__init__.py
+Upstream is distributed under the Apache License, Version 2.0.
+The adaptation adds input validation, restricts unsupported geometry, and
+stores the raw VAE result in a portable target-specific safetensors file.
+
+This independent compatibility project works with Krea 2 and Krea2 Identity
+Edit through ComfyUI-Krea2Edit's existing nodes. It does not imply endorsement
+by their authors. No Krea 2, Identity Edit LoRA, or Qwen model weights are
+included or redistributed.
