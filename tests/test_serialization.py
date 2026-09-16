@@ -1,6 +1,7 @@
 """Format roundtrip and malformed-file coverage using real safetensors."""
 
 import tempfile
+import base64
 import unittest
 from pathlib import Path
 
@@ -34,6 +35,18 @@ class ArtemKo7vSerializationTests(unittest.TestCase):
                 self.assertTrue(loaded.reference_latent.is_contiguous())
                 with safe_open(str(self.path), framework="pt") as handle:
                     self.assertEqual(handle.keys(), ["appearance_latent"])
+
+    def test_frozen_v01_file_loads_without_vision_cache(self):
+        fixture = Path(__file__).parent / "fixtures" / "appearance_v01.safetensors.b64"
+        self.path.write_bytes(base64.b64decode(fixture.read_text(encoding="ascii")))
+        loaded = _load_identity_mod(self.path)
+        self.assertIsNone(loaded.qwen_vision_cache)
+        self.assertEqual(loaded.metadata["format_version"], "0.1.0")
+        self.assertEqual(loaded.reference_latent.shape, (1, 2, 8, 8))
+        self.assertEqual(loaded.identity_name, "Alice")
+        self.path.write_bytes(_serialize_identity_mod(loaded))
+        again = _load_identity_mod(self.path)
+        self.assertTrue(torch.equal(loaded.reference_latent, again.reference_latent))
 
     def test_invalid_metadata(self):
         for key, value in (

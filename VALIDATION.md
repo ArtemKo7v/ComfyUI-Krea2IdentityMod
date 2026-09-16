@@ -1,6 +1,97 @@
-# PoC v0.1 validation
+# IdentityMod validation
 
-## Current result
+## PoC v0.2 implementation result (2026-09-15)
+
+The appearance baseline is frozen. This change adds the prompt-independent Qwen
+cache and the image-free grounded encoder, not a new appearance algorithm.
+
+Verified locally with Python 3.13.3, PyTorch 2.7.0+cu126, safetensors 0.7.0:
+
+- All **53 CPU unit tests pass**, including the original 31 tests.
+- A frozen, base64-encoded v0.1 safetensors fixture loads and roundtrips unchanged.
+- Complete v0.2 roundtrip is exact for float16, bfloat16, float32, and float64.
+- Missing/extra cache tensors, invalid grid, wrong DeepStack count, invalid dtypes,
+  metadata mismatches, and contradictory version/cache flags are rejected.
+- Fake extraction calls preprocessing and the vision boundary once; language encoding
+  is not called during creation. Returned data is detached, CPU-owned, and contiguous.
+- Scoped injection delegates ordinary descriptors and restores the prior method on
+  success, inference failure, nested scopes, and serialized concurrent use.
+- Both new nodes pass a Save/Load/To Latent/Info/positive/negative lifecycle test.
+- Loaded cache reuse across prompts and system prompts, and a vision-raises guard,
+  pass with API doubles. These tests **do not prove actual Qwen numerical parity**.
+- The opt-in `validation.run_qwen_ab` matrix driver is itself tested with doubles.
+
+The local standalone PyTorch build reports the installed GPU's `sm_120` capability
+as unsupported; an attempted GPU-only tensor check failed with no compatible kernel.
+The completed unit suite is deliberately CPU-only. No environment was changed, and
+the user's installed ComfyUI files, models, API, and history were not accessed for v0.2.
+
+The existing user-supplied `res/identity_mod_sagalova.safetensors` was preserved:
+SHA-256 `bca4519e830616ae468a6c2d180bcd33708bb81639321463f770f5c3cf3c9943`.
+The portable synthetic fixture in `tests/fixtures` avoids depending on private images
+or untracked `res` files in the unit suite.
+
+## Accepted v0.1 baseline
+
+The v0.2 task records successful direct-vs-cached appearance validation. The supplied
+`sam004` pair was pixel-identical for direct and cached VAE decoding; the supplied
+`sam003`/`sam005` pair was also pixel-identical for the compared generated outputs.
+This supersedes the earlier pending status below for those tested cases, not for
+every geometry or model configuration. The 5D handoff fix remains covered by tests.
+The texture investigation is closed and was not reopened for this implementation.
+
+## Pending v0.2 real-model acceptance
+
+Use the same image, actual Krea2 Qwen3-VL 4B checkpoint/quantization, software revisions,
+device, attention backend, and prompt/system prompt in both paths. Record these names
+alongside results; no checkpoint fingerprint is embedded in the cache.
+
+| Grounding cap | Short / scene-change / long / empty prompts | Default / custom system | Vision-raises guard | Timing |
+| --- | --- | --- | --- | --- |
+| 512 | Pending | Pending | Pending | Pending |
+| 768 | Pending | Pending | Pending | Pending |
+| 1024 | Pending | Pending | Pending | Pending |
+
+For each row create and save/load **one** cache and reuse it across all prompts.
+Compare every scheduled conditioning tensor and masks: shape, dtype, max absolute
+error, mean absolute error, `torch.equal`, and `torch.allclose`. The helper reports
+diagnostic `atol=1e-6, rtol=1e-5`; this is not a pre-approved acceptance tolerance.
+Investigate every non-exact result and document any justified tolerance explicitly.
+
+`validation.run_qwen_ab(clip, appearance, image, upstream_node.encode)` accepts live
+objects and the **actual upstream** node method; it does not reproduce the reference
+implementation. It returns JSON-ready records, including synchronized wall-clock
+times and evidence that disabling the real tower still permits cached encode while
+blocking direct encode. Run only in an otherwise idle process: instrumentation is
+temporary but shared CLIP models are not isolated by cloning. The helper has not been
+run here against actual weights. It is a developer helper, not a registered UI node.
+
+Then build the generation workflow described in README with **no source Load Image**,
+no creation nodes, and no source VAE Encode. Use the same loaded full IdentityMod
+for appearance, positive, and empty negative; retain output VAE decoding. Queue a
+full generation and record the result. Export a workflow JSON only after that graph
+has actually run successfully. This product-level test remains pending.
+
+Do not claim v0.2 accepted or faster until those tests are performed. GPU kernel
+behavior, installed-version integration, real conditioning parity, and full image-free
+sampling cannot be established with the CPU/API-double tests.
+
+## v0.2 compatibility sources
+
+Public upstream sources were reviewed on 2026-09-15; local installation files were not used:
+
+- [Qwen3-VL preprocessing and DeepStack](https://github.com/Comfy-Org/ComfyUI/blob/master/comfy/text_encoders/qwen3vl.py).
+- [Krea2 4B encoder and 12 taps](https://github.com/Comfy-Org/ComfyUI/blob/master/comfy/text_encoders/krea2.py).
+- [Generic token processing](https://github.com/Comfy-Org/ComfyUI/blob/master/comfy/sd1_clip.py)
+  and [CLIP model loading/scheduled encode](https://github.com/Comfy-Org/ComfyUI/blob/master/comfy/sd.py).
+- [Krea2Edit grounded template and area downscaling](https://github.com/lbouaraba/comfyui-krea2edit/blob/main/__init__.py).
+
+These are moving upstream branches, not a guarantee of compatibility with every
+installed revision. Model/schema discovery fails explicitly when the expected API is absent.
+
+## Historical v0.1 implementation report (superseded where noted above)
+
+### Result at initial v0.1 implementation
 
 Implementation and unit validation are complete. The core hypothesis of equivalent
 real-model generation is **not yet validated**.
@@ -17,7 +108,7 @@ Checks performed on Windows with Python 3.13.3, PyTorch 2.7.0+cu126, and safeten
 
 The package-import check above was performed before the 0.1.1 runtime-shape fix.
 
-## Runtime-shape regression fixed in 0.1.1
+### Runtime-shape regression fixed in 0.1.1
 
 The supplied `res/sam002.png` shows stripe artifacts. Its workflow uses a saved
 4D IdentityMod reference. The supplied safetensors file passes format validation and
@@ -47,7 +138,7 @@ The supplied A/B workflows also differ in additional reference inputs, Identity 
 LoRA strength, the empty latent node, and the input image filename/hash. Use one
 reference, identical images and settings, and the same target node for the next A/B run.
 
-## Earlier environment check
+### Earlier environment check
 
 Full ComfyUI startup through the available Python environment failed before node loading:
 `comfy_aimdo.vram_buffer` was unavailable; `comfy_kitchen` also reported incompatible APIs.
@@ -58,7 +149,7 @@ Consequently, UI visibility, real-model execution, end-to-end output equivalence
 performance have not been verified. No exported workflow JSON is claimed to be validated.
 Use the explicit connection diagrams in README until workflows can be exported and tested.
 
-## Compatibility review
+### Compatibility review
 
 The full-grid preprocessing was checked against
 [ComfyUI-Krea2Edit source](https://github.com/lbouaraba/comfyui-krea2edit/blob/main/__init__.py),
@@ -75,7 +166,7 @@ uses 2x2 latent patches. Requiring pixel dimensions divisible by 16 prevents thi
 This repository does not import those private helpers or implement a transformer forward.
 Source review is not a substitute for real-model validation against the installed revisions.
 
-## Required real-model matrix
+### Originally proposed v0.1 real-model matrix
 
 Use one suitably matched reference for each geometry. All dimensions below are width x height.
 Seeds are fixed suggestions; record replacements if different seeds are used.

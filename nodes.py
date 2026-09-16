@@ -1,4 +1,4 @@
-"""ComfyUI lifecycle and diagnostic nodes for Krea2 IdentityMod PoC v0.1."""
+"""ComfyUI lifecycle, appearance, and cached grounding nodes for IdentityMod."""
 
 import logging
 
@@ -13,6 +13,8 @@ from .identity_mod import (
 from .paths import _list_identity_mod_files, _resolve_identity_mod_file, _save_identity_mod
 from .preprocessing import _create_identity_mod
 from .serialization import _load_identity_mod
+from .qwen_cache import _add_qwen_vision_cache
+from .qwen_injection import _encode_cached_grounded
 
 logger = logging.getLogger(__name__)
 
@@ -195,7 +197,7 @@ class ArtemKo7vKrea2IdentityModInfo:
         """Return an English summary suitable for any ComfyUI string display node."""
         _require_identity_mod(identity_mod)
         metadata = identity_mod.metadata
-        return ("\n".join((
+        lines = [
             "Krea2 IdentityMod", "",
             f"Name: {metadata['identity_name']}",
             f"Description: {metadata['description']}",
@@ -207,9 +209,91 @@ class ArtemKo7vKrea2IdentityModInfo:
             f"x{metadata['target_latent_width']}",
             f"Dtype: {metadata['latent_dtype']}",
             f"Preprocess: {metadata['preprocess_mode']}",
-            "Qwen cache: no",
+            "Appearance cache: yes",
+            "Qwen cache: " + ("yes" if identity_mod.qwen_vision_cache is not None else "no"),
             f"Created: {metadata['created_at_utc']}",
-        )),)
+        ]
+        if identity_mod.qwen_vision_cache is not None:
+            lines.extend([
+                "", f"Qwen model: {metadata['qwen_model_type']}",
+                f"Grounding resolution: {metadata['qwen_grounding_px']}",
+                f"Qwen input: {metadata['qwen_input_width']}x{metadata['qwen_input_height']}",
+                f"Visual tokens: {metadata['qwen_merged_tokens']}",
+                f"Visual width: {metadata['qwen_merged_width']}",
+                f"Visual dtype: {metadata['qwen_merged_dtype']}",
+                f"Grid: {metadata['qwen_grid_shape']} ({metadata['qwen_grid_dtype']})",
+                f"DeepStack tensors: {metadata['qwen_deepstack_count']}",
+                f"DeepStack dtype: {metadata['qwen_deepstack_dtype']}",
+                f"Qwen cache schema: {metadata['qwen_cache_schema']}",
+            ])
+        return ("\n".join(lines),)
+
+
+class ArtemKo7vKrea2IdentityModAddQwenVisionCache:
+    """Add prompt-independent Qwen3-VL visual features to an IdentityMod."""
+
+    CATEGORY = NODE_CATEGORY
+    RETURN_TYPES = (IDENTITY_MOD_COMFY_TYPE,)
+    RETURN_NAMES = ("identity_mod",)
+    FUNCTION = "add_qwen_vision_cache"
+    DESCRIPTION = (
+        "Adds or replaces the Qwen3-VL vision cache for image-free grounded encoding. "
+        "Use the same source image as for the appearance cache."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        """Grounding resolution is a creation-time parameter only."""
+        return {"required": {
+            "identity_mod": (IDENTITY_MOD_COMFY_TYPE,),
+            "clip": ("CLIP", {"tooltip": "Krea2 Qwen3-VL 4B text encoder."}),
+            "image": ("IMAGE", {"tooltip": "The same single reference used for appearance."}),
+            "grounding_px": ("INT", {
+                "default": 768, "min": 0, "max": 4096, "step": 64,
+                "tooltip": "Maximum input side; 0 keeps native size. Does not upscale.",
+            }),
+        }}
+
+    def add_qwen_vision_cache(
+        self, identity_mod: ArtemKo7vKrea2IdentityModData, clip, image: torch.Tensor,
+        grounding_px: int = 768,
+    ) -> tuple[ArtemKo7vKrea2IdentityModData]:
+        """Return a new full-cache object, leaving the input unchanged."""
+        result = _add_qwen_vision_cache(identity_mod, clip, image, grounding_px)
+        logger.info("%s Added Qwen vision cache: %s tokens, grounding_px=%d.", LOG_PREFIX,
+                    result.metadata["qwen_merged_tokens"], grounding_px)
+        return (result,)
+
+
+class ArtemKo7vKrea2IdentityModGroundedEncode:
+    """Encode a current Krea2 edit prompt using cached Qwen3-VL visual features."""
+
+    CATEGORY = NODE_CATEGORY
+    RETURN_TYPES = ("CONDITIONING",)
+    RETURN_NAMES = ("conditioning",)
+    FUNCTION = "encode"
+    DESCRIPTION = (
+        "Uses the IdentityMod vision cache instead of a source image; runs the current "
+        "prompt through the stock Qwen language model. Empty negative prompts are supported."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        """Declare image-free positive or negative encoding inputs."""
+        return {
+            "required": {
+                "clip": ("CLIP",), "identity_mod": (IDENTITY_MOD_COMFY_TYPE,),
+                "prompt": ("STRING", {"default": "", "multiline": True}),
+            },
+            "optional": {"system_prompt": ("STRING", {"default": "", "multiline": True})},
+        }
+
+    def encode(
+        self, clip, identity_mod: ArtemKo7vKrea2IdentityModData, prompt: str,
+        system_prompt: str = "",
+    ) -> tuple[list]:
+        """Return stock scheduled conditioning without invoking the vision tower."""
+        return (_encode_cached_grounded(clip, identity_mod, prompt, system_prompt),)
 
 
 NODE_CLASS_MAPPINGS = {
@@ -218,6 +302,8 @@ NODE_CLASS_MAPPINGS = {
     "ArtemKo7vKrea2IdentityModLoad": ArtemKo7vKrea2IdentityModLoad,
     "ArtemKo7vKrea2IdentityModToLatent": ArtemKo7vKrea2IdentityModToLatent,
     "ArtemKo7vKrea2IdentityModInfo": ArtemKo7vKrea2IdentityModInfo,
+    "ArtemKo7vKrea2IdentityModAddQwenVisionCache": ArtemKo7vKrea2IdentityModAddQwenVisionCache,
+    "ArtemKo7vKrea2IdentityModGroundedEncode": ArtemKo7vKrea2IdentityModGroundedEncode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -226,4 +312,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ArtemKo7vKrea2IdentityModLoad": "Krea2 IdentityMod Load",
     "ArtemKo7vKrea2IdentityModToLatent": "Krea2 IdentityMod To Latent",
     "ArtemKo7vKrea2IdentityModInfo": "Krea2 IdentityMod Info",
+    "ArtemKo7vKrea2IdentityModAddQwenVisionCache": "Krea2 IdentityMod Add Qwen Vision Cache",
+    "ArtemKo7vKrea2IdentityModGroundedEncode": "Krea2 IdentityMod Grounded Encode",
 }

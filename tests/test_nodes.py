@@ -56,6 +56,26 @@ class ArtemKo7vNodeTests(unittest.TestCase):
         after = self.nodes.ArtemKo7vKrea2IdentityModLoad.IS_CHANGED(filename)
         self.assertNotEqual(before, after)
 
+    def test_full_cache_node_lifecycle(self):
+        from tests.support import make_mod
+        from tests.qwen_support import ArtemKo7vFakeClip, install_model_management_stub
+        install_model_management_stub(self)
+        clip = ArtemKo7vFakeClip()
+        full, = self.nodes.ArtemKo7vKrea2IdentityModAddQwenVisionCache().add_qwen_vision_cache(
+            make_mod(), clip, torch.ones(1, 64, 64, 3), 768)
+        filename, = self.nodes.ArtemKo7vKrea2IdentityModSave().save(full, "full")
+        loaded, = self.nodes.ArtemKo7vKrea2IdentityModLoad().load(filename)
+        with patch.object(clip.transformer, "visual", side_effect=AssertionError("Unexpected vision")):
+            positive, = self.nodes.ArtemKo7vKrea2IdentityModGroundedEncode().encode(clip, loaded, "jacket")
+            negative, = self.nodes.ArtemKo7vKrea2IdentityModGroundedEncode().encode(clip, loaded, "")
+            latent, = self.nodes.ArtemKo7vKrea2IdentityModToLatent().to_latent(
+                loaded, {"samples": torch.zeros(1, 2, 8, 8)})
+        self.assertFalse(torch.equal(positive[0][0], negative[0][0]))
+        self.assertTrue(torch.equal(latent["samples"].squeeze(2), full.reference_latent))
+        info, = self.nodes.ArtemKo7vKrea2IdentityModInfo().get_info(loaded)
+        for line in ("Qwen cache: yes", "Grounding resolution: 768", "Visual tokens: 4", "DeepStack tensors: 3"):
+            self.assertIn(line, info)
+
     def test_handoff_preserves_channelwise_5d_model_normalization(self):
         """A 4D source broadcasts channels into frames in Krea2's Wan21 normalization."""
         from tests.support import make_mod
@@ -93,7 +113,7 @@ class ArtemKo7vNodeTests(unittest.TestCase):
         self.addCleanup(lambda: [sys.modules.pop(key, None) for key in list(sys.modules)
                                  if key == name or key.startswith(name + ".")])
         spec.loader.exec_module(module)
-        self.assertEqual(len(module.NODE_CLASS_MAPPINGS), 5)
+        self.assertEqual(len(module.NODE_CLASS_MAPPINGS), 7)
         self.assertEqual(set(module.NODE_CLASS_MAPPINGS), set(module.NODE_DISPLAY_NAME_MAPPINGS))
         self.assertEqual(module.__all__, ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"])
         for key, node in module.NODE_CLASS_MAPPINGS.items():

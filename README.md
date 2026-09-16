@@ -2,8 +2,9 @@
 
 This repository is an experimental Proof of Concept.
 
-PoC v0.1 caches only the VAE appearance path of Krea2 Identity Edit. The reference
-image is still required by `Krea2EditGroundedEncode` for Qwen3-VL semantic grounding.
+PoC v0.2 adds a prompt-independent Qwen3-VL vision cache to the successful v0.1
+appearance-cache baseline. Full IdentityMods are designed for image-free generation;
+appearance-only v0.1 files still need the image in upstream grounded encoding.
 Each IdentityMod is target-resolution-specific. Arbitrary mismatched aspect ratios
 are intentionally not supported yet.
 
@@ -13,21 +14,49 @@ A small ComfyUI node pack that encodes one reference image once, saves its raw V
 latent in a portable `.safetensors` file, and exposes the loaded reference as a
 standard `LATENT` for the existing `Krea2EditModelPatch.source_latent` input.
 
-The hypothesis is that replacing repeated reference VAE encoding with this lossless
-cache preserves the generated result at a matching target geometry. This is not a
-finished replacement for reference images, and it does not train or modify weights.
+The file can also hold Qwen visual features. The current prompt is always processed
+again by the Qwen language model. No training or weight modification is performed.
 
-## PoC status
+## PoC v0.2 status
 
-Implemented: all five nodes, preprocessing, format validation, lossless serialization,
-safe filenames, and strict runtime geometry checks. Unit tests pass on CPU, and the
-package imports with the real ComfyUI folder registry.
+Implemented: seven nodes, visual extraction, scoped injection into stock Qwen token
+processing, complete-cache validation, and lossless v0.1/v0.2 serialization.
+All 53 CPU unit tests pass. v0.1 appearance behavior and its 5D runtime handoff are retained.
 
-Real-model A/B validation is **pending**. Output equivalence has not yet been demonstrated
-with a Krea2 checkpoint. See [validation status](VALIDATION.md) for the checks performed
-and the remaining acceptance matrix. No unvalidated workflow JSON is distributed.
+v0.1 is the accepted appearance baseline. **v0.2 real-model conditioning equivalence,
+image-free generation, and performance are pending**, not established by API-double tests.
+See [validation status](VALIDATION.md). No unvalidated workflow JSON is distributed.
 
-## How it works
+## Image-free runtime
+
+```text
+Load IdentityMod
+    +--> To Latent (+ target LATENT) --> Krea2EditModelPatch.source_latent
+    +--> Grounded Encode (+ CLIP + current prompt) --> KSampler.positive
+    +--> Grounded Encode (+ CLIP + empty prompt) ----> KSampler.negative
+```
+
+The generation graph needs neither the source image nor its VAE encoder nor Qwen
+vision-tower execution. It still needs the Qwen language model and an output VAE decoder.
+ComfyUI may load the combined text/vision checkpoint: this PoC skips vision execution,
+not necessarily its weight allocation. No reduced-VRAM or speedup claim is made.
+
+## Qwen3-VL vision cache
+
+The cache stores `merged`, integer `grid`, and all three DeepStack tensors, captured
+from the loaded transformer's `preprocess_embed` boundary. It does not store the
+12 prompt-conditioned Krea2 hidden states. CPU storage preserves values and dtypes;
+there is no filtering, feature normalization, or quantization.
+
+Runtime uses stock tokenization, image spans, MRoPE, DeepStack injection, language
+layers, 12 Krea2 taps, and scheduled conditioning. A namespaced per-call descriptor
+temporarily replaces only image preprocessing. An `RLock` serializes this pack's
+extraction/injection calls; `finally` restores the original method even on failure.
+Ordinary image descriptors delegate unchanged. This is not a global lock for unrelated
+extensions operating on the same CLIP concurrently; run validation in an idle process.
+No persistent GPU feature copies or patched methods are retained.
+
+## Appearance-only baseline
 
 ```text
 Creation:
@@ -53,6 +82,8 @@ Nodes appear under `ArtemKo7v/Krea2 IdentityMod`:
 | Krea2 IdentityMod Load | identity_mod_file | identity_mod |
 | Krea2 IdentityMod To Latent | identity_mod, target_latent | source_latent |
 | Krea2 IdentityMod Info | identity_mod | info string |
+| Krea2 IdentityMod Add Qwen Vision Cache | identity_mod, clip, image, grounding_px | new identity_mod |
+| Krea2 IdentityMod Grounded Encode | clip, identity_mod, prompt; optional system_prompt | CONDITIONING |
 
 The internal socket type is `ARTEMKO7V_KREA2_IDENTITY_MOD`. Every node ID and public
 class has the `ArtemKo7v` prefix. Info returns a string; connect a string display node
@@ -121,7 +152,61 @@ Supported images are center-cropped and resized to the exact target grid with
 float32 bicubic interpolation and antialiasing. Only RGB is encoded; alpha is discarded
 and pixels are clamped to `[0, 1]`. A genuinely mismatched aspect ratio raises an error.
 
-## Using an IdentityMod
+## Creating a full IdentityMod
+
+1. Create the appearance IdentityMod as above, or load an existing v0.1 file.
+2. Connect it to **Krea2 IdentityMod Add Qwen Vision Cache**.
+3. Connect the Krea2 Qwen3-VL 4B `CLIP` and the **same original source IMAGE**.
+4. Set `grounding_px`, normally `768`, matching the direct grounded-encoding baseline.
+5. Connect the updated `identity_mod` output to the existing Save node. Save under a
+   new name, for example `alice/square_1024_qwen768`, to retain the old file.
+6. Info should report format `0.2.0`, Qwen cache `yes`, and three DeepStack tensors.
+
+The pack cannot prove both caches came from the same image. You must supply the same
+source yourself. Calling Add Qwen Vision Cache again replaces, rather than merges,
+the visual cache and leaves the input object and appearance values unchanged.
+
+## Using a full IdentityMod
+
+1. Load the saved v0.2 file in a separate generation workflow.
+2. Wire Load to To Latent and keep the matching target connected to To Latent and KSampler.
+3. Wire To Latent to `Krea2EditModelPatch.source_latent`, select `crop (legacy)`, and
+   disconnect the patch's source image/VAE inputs so they cannot override the cache.
+4. Add two **Krea2 IdentityMod Grounded Encode** nodes. Connect the same loaded
+   IdentityMod and Krea2 CLIP to both. Enter the edit prompt in the positive node;
+   leave the negative prompt empty. Connect their outputs to KSampler.
+5. Keep the model, Identity Edit LoRA, sampler, and output VAE decoding connections.
+6. Remove the source Load Image, creation nodes, source VAE Encode, and upstream
+   image-grounded encoders from the runtime graph. Queue generation.
+
+Empty or whitespace-only `system_prompt` uses the upstream default. A custom system
+prompt is applied at runtime; neither it nor the edit prompt is stored in the cache.
+
+## Grounding resolution
+
+`grounding_px` belongs to cache creation only. It caps the longest image side using
+area downscaling without upscaling; `0` preserves native input dimensions. Qwen then
+performs its normal patch-grid preprocessing. Info reports both the cap and the
+image dimensions passed to Qwen (not the internal patch-rounded dimensions).
+Rebuild the Qwen cache for another resolution. The runtime node has no resolution
+control. Appearance target geometry and grounding resolution are independent.
+
+## Text encoder compatibility
+
+PoC v0.2 Qwen visual caches are intended for the Krea2 Qwen3-VL 4B text encoder family.
+For strict reproducibility, create and use the cache with the same text-encoder
+checkpoint and quantization configuration. Family, width, tap layers, and schema are
+checked; checkpoint fingerprints are not. A generic Qwen encoder is not a substitute
+for the Krea2 encoder. Unsupported API/schema changes fail explicitly.
+
+## Backwards compatibility
+
+Create still produces appearance-only format `0.1.0`. Existing v0.1.x files load with
+no vision cache and work through To Latent exactly as before. Grounded Encode rejects
+them with instructions to add a cache; it never falls back silently to text-only encoding.
+Adding a complete vision cache produces `0.2.0`. The same Save/Load nodes handle both.
+
+## Using an appearance-only IdentityMod
 
 Start with a working single-reference Krea2 Identity Edit workflow and use these connections:
 
@@ -167,8 +252,8 @@ pack and restart ComfyUI. The file format version remains `0.1.0`.
   2x2 latent patches otherwise cause upstream padding and potentially latent interpolation.
 - Stored latents are exactly `1 x C x H x W`. Image-only `B x C x 1 x H x W` targets
   and VAE results are accepted; the VAE result's singleton frame axis is removed.
-- No Qwen cache, embedded preview image, frontend extension, automatic model loading,
-  model downloads, or sampling modifications.
+- One Qwen grounding resolution per file; no multi-reference support, embedded preview,
+  frontend extension, model downloads, or sampling modifications.
 - File geometry validation cannot identify which VAE weights were used. Use the same
   compatible VAE and model configuration for a valid comparison.
 - Atomic non-overwriting saves require filesystem hard-link support (for example NTFS
@@ -176,19 +261,23 @@ pack and restart ComfyUI. The file format version remains `0.1.0`.
 
 ## File format
 
-Safetensors format `krea2_identitymod`, version `0.1.0`. The loader accepts stable `0.1.x`
-versions and rejects other major/minor versions. New files contain exactly one tensor:
+Safetensors format `krea2_identitymod`. The loader accepts stable `0.1.x` and `0.2.x`
+versions and rejects other major/minor versions. Appearance-only files contain one tensor;
+full-cache files contain all six:
 
 | Key | Representation |
 | --- | --- |
 | `appearance_latent` | CPU-contiguous floating-point raw VAE latent, `1 x C x H x W` |
+| `qwen_vision_merged` | Floating-point merged visual features, `tokens x 2560` |
+| `qwen_vision_grid` | Integer `1 x 3` tensor containing `T, H, W`; `T=1` |
+| `qwen_vision_deepstack_0/1/2` | Three floating-point tensors, each `tokens x 2560` |
 
 Original dtype and values are preserved; no FP16 conversion or quantization occurs.
 Metadata values are strings. Required fields are:
 
 | Fields | Meaning or required value |
 | --- | --- |
-| `format`, `format_version` | `krea2_identitymod`, `0.1.0` when writing |
+| `format`, `format_version` | `krea2_identitymod`; `0.1.0` or `0.2.0` when writing |
 | `creator`, `model_family` | `ComfyUI-Krea2IdentityMod`, `krea2` |
 | `identity_name`, `description` | User-supplied descriptive metadata |
 | `purpose` | `appearance_reference` |
@@ -197,11 +286,17 @@ Metadata values are strings. Required fields are:
 | `latent_channels`, `latent_dtype` | Channel count and exact dtype, e.g. `torch.float32` |
 | `source_width`, `source_height` | Original image dimensions |
 | `preprocess_mode` | `full_target_grid_near_matched_fit` |
-| `vae_downscale_factor`, `qwen_cache_present` | `8`, `false` |
+| `vae_downscale_factor`, `qwen_cache_present` | `8`; `false` (v0.1) or `true` (v0.2) |
 | `created_at_utc` | ISO 8601 UTC creation timestamp |
 
 The loader cross-checks metadata against tensor shape and dtype, rejects non-finite
-latent values, and tolerates unknown metadata and tensor keys without using them.
+latent values, and tolerates unknown metadata and unrelated tensor keys without using them.
+The reserved `qwen_vision_` tensor namespace must be complete and contain exactly the
+five defined visual tensors. Partial caches and contradictory versions/flags are rejected.
+For full files, required metadata also includes `qwen_cache_schema=qwen3vl_visual_v1`,
+`qwen_model_family=qwen3vl`, `qwen_model_type=qwen3vl_4b`, `qwen_grounding_px`,
+`qwen_input_width/height`, `qwen_merged_dtype/tokens/width`, `qwen_grid_dtype/shape`,
+and `qwen_deepstack_count/dtype/width`. Grid shape is a JSON list string, `[1, 3]`.
 It never deserializes Python objects. Reload detection uses resolved path, modification
 time, creation/change time, and file size. A file replacement that preserves all of
 these attributes is not detected by a content hash.
@@ -212,6 +307,32 @@ complete temporary file atomically under an available filename; overwrite uses a
 replacement. Neither mode intentionally exposes a partial `.safetensors` file.
 
 ## A/B validation
+
+The v0.2 primary comparison is **actual CONDITIONING**, not visual similarity:
+upstream `Krea2EditGroundedEncode` with the image versus the new encoder with a saved
+and reloaded cache. Reuse one cache per resolution across short, long, scene-change,
+and empty prompts, with default and custom system prompts; repeat at 512/768/1024.
+Record tensor shape, dtype, max/mean absolute error, `torch.equal`, and `torch.allclose`.
+Also compare attention masks and scheduled entries. Investigate any nonzero errors.
+
+An opt-in developer helper in [validation.py](validation.py) accepts already loaded
+objects and the real upstream `encode` callable. It runs the matrix, save/load,
+synchronized encode timings, and a vision-tower-raises guard. It does not access
+models or run on import; it is not a standalone command or a GUI node. Usage in an
+existing in-process test harness, where `identitymod_package` is this loaded package:
+
+```python
+from identitymod_package.validation import run_qwen_ab
+records = run_qwen_ab(clip, appearance_identity_mod, image,
+                      upstream_grounded_encoder.encode)
+```
+
+The returned list is JSON-serializable. Save it with the exact software/model/device
+configuration. Timings include encode overhead and may include loading/warm-up;
+repeat in alternating order before claiming performance improvements. Full image-free
+sampler generation still needs a separate manual workflow run.
+
+The following remains the frozen **appearance-path** comparison for v0.1 regression:
 
 Run the matrix in [VALIDATION.md](VALIDATION.md) with actual Krea2 weights. Both branches
 must use the same source image, target resolution, checkpoint, LoRA and strength,
@@ -248,11 +369,22 @@ demonstrate an image-free or completely VAE-free pipeline, or a measured end-to-
 | Even latent H/W required | Use pixel dimensions divisible by 16 to avoid upstream patch-padding interpolation. |
 | Wrong latent channels or encoded shape | Check the Krea2 VAE, target latent, and model combination. |
 | Stripes or distorted appearance with a loaded reference | Update to node pack 0.1.1 or later and restart. To Latent must restore the singleton frame axis before Krea2 normalization. |
-| Poor Krea2 output quality | Ensure grounded encoding still receives the original image, Identity Edit LoRA is enabled, geometry matches, and `ref_boost` is intended. |
+| Poor Krea2 output quality | Check the correct vision cache (or source image for v0.1), Identity Edit LoRA, target geometry, and `ref_boost`. |
 | Upstream `fit` warning | Use `crop (legacy)` for the cached full-grid latent. |
 | Empty Load dropdown | Save/copy a file into `models/krea2_identitymods`, then refresh node definitions or restart ComfyUI. |
 | File cannot be saved | Use a valid relative filename, check permissions, and use storage supporting atomic hard links. |
-| Unsupported format or version | Select an IdentityMod `0.1.x` file, not a checkpoint or LoRA. |
+| Unsupported format or version | Select an IdentityMod `0.1.x` or `0.2.x` file, not a checkpoint or LoRA. |
+| Missing Qwen cache | Add Qwen Vision Cache to the appearance file and save the updated output. |
+| Unsupported CLIP | Use the Krea2 Qwen3-VL 4B encoder with vision support and 12 Krea2 taps. |
+| Wrong image placeholder count | Remove extra image/ChatML special tokens from the prompt. |
+
+## Known testing caveats
+
+The previously reported overcooked texture was isolated during v0.1 validation and
+is not being treated as a cache/serialization defect. Reusing the source-generation
+prompt and seed can be misleading for visual-quality evaluation. Fixed prompt/seed
+is appropriate for path-equivalence comparisons; use changed prompts and/or seeds
+for representative quality tests. Do not add filtering to either cache to mask it.
 
 ## Development
 
@@ -279,7 +411,7 @@ included; their respective licenses apply separately.
 
 ## Roadmap
 
-1. Complete the real-model A/B matrix and confirm equivalence and absence of source VAE calls.
+1. Complete v0.2 real-model conditioning A/B and prove vision execution is skipped.
 2. Export and validate creation and generation workflows from that environment.
 3. Consider arbitrary reference geometry and multiple resolution buckets after this PoC passes.
-4. Investigate Qwen visual-feature caching separately; it is outside v0.1.
+4. Consider compatibility fingerprints and multi-reference support only after v0.2 validation.

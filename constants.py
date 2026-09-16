@@ -2,6 +2,12 @@
 
 IDENTITY_MOD_FORMAT = "krea2_identitymod"
 IDENTITY_MOD_FORMAT_VERSION = "0.1.0"
+IDENTITY_MOD_QWEN_FORMAT_VERSION = "0.2.0"
+QWEN_CACHE_TENSOR_KEYS = (
+    "qwen_vision_merged", "qwen_vision_grid",
+    "qwen_vision_deepstack_0", "qwen_vision_deepstack_1", "qwen_vision_deepstack_2",
+)
+KREA2_QWEN_TAP_LAYERS = (2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35)
 IDENTITY_MOD_CREATOR = "ComfyUI-Krea2IdentityMod"
 IDENTITY_MOD_TENSOR_KEY = "appearance_latent"
 IDENTITY_MOD_FOLDER_NAME = "krea2_identitymods"

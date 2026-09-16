@@ -1,5 +1,6 @@
-"""Validated, CPU-resident appearance references independent of a loaded model."""
+"""Validated, CPU-resident appearance and Qwen vision references."""
 
+import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -22,10 +23,10 @@ class ArtemKo7vKrea2IdentityModError(ValueError):
 
 
 def _validate_format_version(version: str) -> None:
-    """Accept stable 0.1.x files and reject incompatible or malformed versions."""
-    if not re.fullmatch(r"0\.1\.(0|[1-9][0-9]*)", version):
+    """Accept stable appearance-only and full-cache files."""
+    if not re.fullmatch(r"0\.[12]\.(0|[1-9][0-9]*)", version):
         raise ArtemKo7vKrea2IdentityModError(
-            f"Unsupported IdentityMod format version: {version!r}. Expected 0.1.x."
+            f"Unsupported IdentityMod format version: {version!r}. Expected 0.1.x or 0.2.x."
         )
 
 
@@ -84,6 +85,8 @@ def _validate_metadata(metadata: Mapping[str, str], samples: torch.Tensor) -> No
         )
     _validate_format_version(metadata["format_version"])
     for key, expected in FIXED_METADATA.items():
+        if key == "qwen_cache_present":
+            continue
         if metadata[key] != expected:
             raise ArtemKo7vKrea2IdentityModError(
                 f"Invalid IdentityMod metadata {key}: expected {expected!r}, "
@@ -120,6 +123,66 @@ def _validate_metadata(metadata: Mapping[str, str], samples: torch.Tensor) -> No
 
 
 @dataclass(frozen=True, eq=False)
+class ArtemKo7vKrea2QwenVisionCache:
+    """Own the prompt-independent Qwen3-VL 4B outputs, without precision conversion."""
+
+    merged: torch.Tensor
+    grid: torch.Tensor
+    deepstack: tuple[torch.Tensor, ...]
+
+    def __post_init__(self) -> None:
+        self.validate()
+        for name in ("merged", "grid"):
+            object.__setattr__(self, name, getattr(self, name).detach().cpu().contiguous().clone())
+        object.__setattr__(self, "deepstack", tuple(
+            tensor.detach().cpu().contiguous().clone() for tensor in self.deepstack
+        ))
+
+    def validate(self) -> None:
+        """Reject partial, malformed, non-finite, or incompatible vision outputs."""
+        if not isinstance(self.deepstack, (tuple, list)) or len(self.deepstack) != 3:
+            raise ArtemKo7vKrea2IdentityModError("Qwen cache requires exactly 3 DeepStack tensors.")
+        for tensor in (self.merged, self.grid, *self.deepstack):
+            if (not isinstance(tensor, torch.Tensor) or tensor.layout != torch.strided
+                    or tensor.device.type == "meta"):
+                raise ArtemKo7vKrea2IdentityModError("Qwen cache requires dense tensors with data.")
+        if self.merged.ndim != 2 or self.merged.shape[0] < 1 or self.merged.shape[1] != 2560:
+            raise ArtemKo7vKrea2IdentityModError("Qwen merged must have shape (tokens, 2560).")
+        for tensor in (self.merged, *self.deepstack):
+            if (not tensor.is_floating_point() or tensor.shape != self.merged.shape
+                    or not torch.isfinite(tensor).all().item()):
+                raise ArtemKo7vKrea2IdentityModError(
+                    "Qwen merged/DeepStack must be finite floating tensors with matching shapes."
+                )
+        if any(t.dtype != self.deepstack[0].dtype for t in self.deepstack):
+            raise ArtemKo7vKrea2IdentityModError("DeepStack tensor dtypes must match each other.")
+        if self.grid.dtype not in (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8):
+            raise ArtemKo7vKrea2IdentityModError("Qwen grid must use an integer dtype.")
+        if self.grid.shape != (1, 3):
+            raise ArtemKo7vKrea2IdentityModError("Qwen grid must have shape (1, 3) for one image.")
+        frames, height, width = self.grid[0].tolist()
+        if frames != 1 or height <= 0 or width <= 0 or height % 2 or width % 2:
+            raise ArtemKo7vKrea2IdentityModError("Qwen image grid requires T=1 and positive even H/W.")
+        if height * width // 4 != self.merged.shape[0]:
+            raise ArtemKo7vKrea2IdentityModError("Qwen grid does not match the merged token count.")
+
+    def tensor_metadata(self) -> dict[str, str]:
+        """Return schema fields derived from actual tensors, not user estimates."""
+        return {
+            "qwen_cache_present": "true", "qwen_cache_schema": "qwen3vl_visual_v1",
+            "qwen_model_family": "qwen3vl", "qwen_model_type": "qwen3vl_4b",
+            "qwen_merged_dtype": str(self.merged.dtype),
+            "qwen_merged_tokens": str(self.merged.shape[0]),
+            "qwen_merged_width": str(self.merged.shape[1]),
+            "qwen_grid_dtype": str(self.grid.dtype),
+            "qwen_grid_shape": json.dumps(list(self.grid.shape)),
+            "qwen_deepstack_count": "3",
+            "qwen_deepstack_dtype": str(self.deepstack[0].dtype),
+            "qwen_deepstack_width": str(self.deepstack[0].shape[1]),
+        }
+
+
+@dataclass(frozen=True, eq=False)
 class ArtemKo7vKrea2IdentityModData:
     """Own a detached raw VAE latent and read-only metadata; treat the tensor as read-only.
 
@@ -129,6 +192,7 @@ class ArtemKo7vKrea2IdentityModData:
 
     reference_latent: torch.Tensor
     metadata: Mapping[str, str]
+    qwen_vision_cache: ArtemKo7vKrea2QwenVisionCache | None = None
 
     def __post_init__(self) -> None:
         """Validate the portable representation and take ownership of its storage."""
@@ -147,6 +211,29 @@ class ArtemKo7vKrea2IdentityModData:
         if not torch.isfinite(self.reference_latent).all().item():
             raise ArtemKo7vKrea2IdentityModError("IdentityMod latent contains non-finite values.")
         _validate_metadata(self.metadata, self.reference_latent)
+        cache = self.qwen_vision_cache
+        has_cache = self.metadata["format_version"].startswith("0.2.")
+        if self.metadata["qwen_cache_present"] != ("true" if has_cache else "false"):
+            raise ArtemKo7vKrea2IdentityModError("Qwen cache flag contradicts the format version.")
+        if (cache is not None) != has_cache:
+            raise ArtemKo7vKrea2IdentityModError("Qwen cache payload contradicts the format version.")
+        if cache is not None:
+            if not isinstance(cache, ArtemKo7vKrea2QwenVisionCache):
+                raise ArtemKo7vKrea2IdentityModError("Invalid Qwen vision cache object.")
+            cache.validate()
+            for key, expected in cache.tensor_metadata().items():
+                if self.metadata.get(key) != expected:
+                    raise ArtemKo7vKrea2IdentityModError(f"Qwen cache metadata mismatch: {key}.")
+            for key in ("qwen_input_width", "qwen_input_height", "qwen_grounding_px"):
+                value = self.metadata.get(key, "")
+                if not re.fullmatch(r"0|[1-9][0-9]*", value):
+                    raise ArtemKo7vKrea2IdentityModError(f"Missing or invalid metadata: {key}.")
+                if key != "qwen_grounding_px" and int(value) < 1:
+                    raise ArtemKo7vKrea2IdentityModError(f"Metadata {key} must be positive.")
+            limit = int(self.metadata["qwen_grounding_px"])
+            if limit > 4096 or (limit and max(int(self.metadata["qwen_input_width"]),
+                                            int(self.metadata["qwen_input_height"])) > limit):
+                raise ArtemKo7vKrea2IdentityModError("Qwen input dimensions exceed grounding_px.")
 
     @property
     def target_width(self) -> int:
